@@ -12,7 +12,6 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.*;
-import java.util.ArrayList;
 
 @RestController
 public class ExtractController {
@@ -25,10 +24,8 @@ public class ExtractController {
 	}
 
 	private static void ensureKeySafety(String key) {
-		if (!AuthController.authorisedKeys.contains(key))
-			throw new Error("unauthorised");
-		if (key.startsWith("../") || key.contains("/../"))
-			throw new Error("dangerous key");
+		if (!AuthController.authorisedKeys.contains(key)) throw new Error("unauthorised");
+		if (key.startsWith("../") || key.contains("/../")) throw new Error("dangerous key");
 	}
 
 	private static String getFileOriginalPath(String key) {
@@ -36,9 +33,9 @@ public class ExtractController {
 		return WORKDIR + "/" + key + ".orig.pdf";
 	}
 
-	private static String getFileExtractedPath(String key) {
+	private static String getExtractedDirPath(String key) {
 		ensureKeySafety(key);
-		return WORKDIR + "/" + key + ".extr.pdf";
+		return WORKDIR + "/extracted_" + key;
 	}
 
 	@PostMapping(path = "/upload")
@@ -49,8 +46,7 @@ public class ExtractController {
 		String path = getFileOriginalPath(key);
 		save(file.getInputStream(), path);
 		int pages = countPages(path);
-		if (pages == -1)
-			return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("failed to read document");
+		if (pages == -1) return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("failed to read document");
 		return ResponseEntity.status(HttpStatus.OK).body("{\"pages\":" + pages + "}");
 	}
 
@@ -79,77 +75,46 @@ public class ExtractController {
 	@PostMapping(path = "/remove")
 	public String remove(@RequestParam("key") String key) {
 		File orig = new File(getFileOriginalPath(key));
-		File extr = new File(getFileExtractedPath(key));
+		File extrDir = new File(getExtractedDirPath(key));
 		if (orig.isFile()) orig.delete();
-		if (extr.isFile()) extr.delete();
+		if (extrDir.isDirectory()) {
+			for (File f : extrDir.listFiles())
+				f.delete();
+			extrDir.delete();
+		}
 		return "{\"success\":true}";
 	}
 
 	@PostMapping(path = "/extract")
-	public ResponseEntity extract(@RequestParam("key") String key, @RequestParam String pages) throws IOException, InterruptedException {
+	public ResponseEntity extract(@RequestParam String key, @RequestParam String selections) throws IOException, InterruptedException {
 		if (!AuthController.authorisedKeys.contains(key)) {
 			return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
 		}
-		String[] pagesSplit = pages.split(",");
-		int[] pagesInts = new int[pagesSplit.length];
-		for (int i = 0; i < pagesInts.length; i++) {
-			try {
-				pagesInts[i] = Integer.parseInt(pagesSplit[i]);
-			} catch (NumberFormatException e) {
-				return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("invalid number: " + pagesSplit[i]);
-			}
-		}
 		String origPath = getFileOriginalPath(key);
-		String extractedPath = getFileExtractedPath(key);
-
+		String extrDir = getExtractedDirPath(key);
 		int pageCount = countPages(origPath);
-		String selectionValidationError = validateSelection(pagesInts, pageCount);
-		if (selectionValidationError != null)
-			return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(selectionValidationError);
-
-		if (extract(origPath, extractedPath, pagesInts))
-			return ResponseEntity.status(HttpStatus.OK).body("{\"success\":true}");
-		return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("failed to execute command");
-	}
-
-	private static String validateSelection(int[] selection, int total) {
-		if (selection.length == 0) return "no selection";
-		if (selection.length == total) return "all selected";
-		if (selection.length > total) return "invalid selection";
-		for (int i = 1; i < selection.length; i++) {
-			// verify ascending order
-			if (selection[i - 1] >= selection[i]) return "invalid selection";
+		String error = ExtractHandler.extract(origPath, extrDir, pageCount, selections);
+		if (error != null) {
+			return ResponseEntity
+					.status(HttpStatus.BAD_REQUEST)
+					.body("{\"message\":\"" + jsonEscape(error) + "\"}");
 		}
-		for (int p : selection) {
-			if (p < 1 || p > total)
-				return "out of range: " + p;
-		}
-		return null;
+		return ResponseEntity.status(HttpStatus.OK).body("{\"success\":true}");
 	}
 
-	private static boolean extract(String source, String target, int[] pages) throws IOException, InterruptedException {
-		ArrayList<String> command = new ArrayList<>();
-		command.add("pdftk");
-		command.add(source);
-		command.add("cat");
-		for (int page : pages) command.add("" + page);
-		command.add("output");
-		command.add(target);
-
-		Process p = new ProcessBuilder(command).start();
-		String output = new String(p.getInputStream().readAllBytes());
-		p.waitFor();
-		if (p.exitValue() != 0) System.out.println(output);
-		return p.exitValue() == 0;
+	private static String jsonEscape(String s) {
+		return s.replaceAll("\\\\", "\\\\\\\\")
+				.replaceAll("\"", "\\\\\"")
+				.replaceAll("\n", "\\n")
+				.replaceAll("\r", "\\r");
 	}
-
 
 	@GetMapping("/download")
 	public ResponseEntity<FileSystemResource> download(@RequestParam("key") String key) {
 		if (!AuthController.authorisedKeys.contains(key)) {
 			return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
 		}
-		File file = new File(getFileExtractedPath(key));
+		File file = new File(getExtractedDirPath(key) + "/" + ExtractHandler.RESULT_FILENAME);
 		if (!file.exists()) {
 			return ResponseEntity.notFound().build();
 		}
